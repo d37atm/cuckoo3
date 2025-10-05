@@ -24,6 +24,7 @@ typeloaders = {
         "user": config.String(default_val="root@pam"),
         "pw": config.String(default_val="input your password here"),
         "timeout": config.Int(default_val=10),
+        "verify_ssl": config.Boolean(default_val=True),
         "interface": config.NetworkInterface(default_val="eno1", must_be_up=False),
         "machines": config.NestedDictionary(
             "example1",
