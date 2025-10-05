@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import time
 
 from cuckoo.common import machines
 from cuckoo.common.config import cfg
@@ -25,6 +26,7 @@ class Proxmox(Machinery):
         self.user = cfg("proxmox.yaml", "user", subpkg="machineries")
         self.pw = cfg("proxmox.yaml", "pw", subpkg="machineries")
         self.timeout = cfg("proxmox.yaml", "timeout", subpkg="machineries")
+        self.verify_ssl = cfg("proxmox.yaml", "verify_ssl", subpkg="machineries")
         self.vms = {}
 
     def load_machines(self):
@@ -58,8 +60,7 @@ class Proxmox(Machinery):
                     )
                 machine.snapshot = tmp[0]["name"]
 
-    def restore_start(self, machine):
-        """Checks if the VM is already running and if its not restores VMs snapshot"""
+    def _start_vm(self, machine, restore=True):
         state = self.state(machine)
         if state != machines.States.POWEROFF:
             raise errors.MachineUnexpectedStateError(
@@ -67,7 +68,7 @@ class Proxmox(Machinery):
                 f"Actual state: {state}"
             )
 
-        if not machine.snapshot:
+        if restore and not machine.snapshot:
             raise errors.MachineNotFoundError(
                 f"While restore_start of {machine.label}."
                 f"Didn't found snapshot. "
@@ -82,19 +83,24 @@ class Proxmox(Machinery):
 
         log.debug(f"Starting analysis machine {machine.label}")
         prox = self._create_proxmoxer_connection()
-        prox.nodes(vm.node_name).qemu(vm.vm_id).snapshot(
-            machine.snapshot
-        ).rollback.post()
 
-        while self.state(machine) != machines.States.RUNNING:
-            log.debug(
-                f"Waiting for {machine.label} to restore snapshot {machine.snapshot}..."
-            )
+        if restore:
+            task_id = prox.nodes(vm.node_name).qemu(vm.vm_id).snapshot(
+                machine.snapshot
+            ).rollback.post()
+            self._wait_for_task(prox, vm.node_name, task_id)
+        else:
+            task_id = prox.nodes(vm.node_name).qemu(vm.vm_id).status.start.post()
+            self._wait_for_task(prox, vm.node_name, task_id)
 
-        log.info(f"restore_start from {machine.label} completed.")
+        log.info(f"start from {machine.label} completed.")
+
+    def restore_start(self, machine):
+        """Checks if the VM is already running and if its not restores VMs snapshot"""
+        self._start_vm(machine, restore=True)
 
     def norestore_start(self, machine):
-        raise NotImplemented
+        self._start_vm(machine, restore=False)
 
     def stop(self, machine):
         """Checks if the VM is running and if it is ungracefully shuts it down"""
@@ -112,14 +118,26 @@ class Proxmox(Machinery):
 
         log.debug(f"Attempting to stop {machine.label}")
         prox = self._create_proxmoxer_connection()
-        prox.nodes(vm.node_name).qemu(vm.vm_id).status.stop.post()
-
-        while self.state(machine) != machines.States.POWEROFF:
-            log.debug(f"Waiting for {machine.label} to stop...")
+        task_id = prox.nodes(vm.node_name).qemu(vm.vm_id).status.stop.post()
+        self._wait_for_task(prox, vm.node_name, task_id)
         log.debug(f"{machine.label} was stopped")
 
     def acpi_stop(self, machine):
-        raise NotImplemented
+        state = self.state(machine)
+        if state == machines.States.POWEROFF:
+            raise errors.MachineUnexpectedStateError(
+                f"VM {machine.label} is already powered off."
+            )
+        vm = self.vms.get(machine.label)
+        if vm is None:
+            raise errors.MachineNotFoundError(
+                f"While stopping vm {machine.label}: Couldn't find in vms list."
+            )
+        log.debug(f"Attempting to gracefully stop {machine.label}")
+        prox = self._create_proxmoxer_connection()
+        task_id = prox.nodes(vm.node_name).qemu(vm.vm_id).status.shutdown.post()
+        self._wait_for_task(prox, vm.node_name, task_id)
+        log.debug(f"{machine.label} was gracefully stopped")
 
     def state(self, machine):
         """Gets the qmpstatus of the VM and turns is to cuckoo compatible state"""
@@ -155,14 +173,15 @@ class Proxmox(Machinery):
 
     def dump_memory(self, machine, path):
         """Not sure if this is even possible..."""
-        raise NotImplemented
+        raise NotImplementedError
 
     def handle_paused(self, machine):
         """Not needed as by restoring the snapshot the VM is already running"""
-        raise NotImplemented
+        raise NotImplementedError
 
     def version(self):
-        raise NotImplemented
+        prox = self._create_proxmoxer_connection()
+        return prox.version.get()
 
     def _create_proxmoxer_connection(self):
         """
@@ -176,7 +195,7 @@ class Proxmox(Machinery):
                 self.dsn,
                 user=self.user,
                 password=self.pw,
-                verify_ssl=False,
+                verify_ssl=self.verify_ssl,
                 timeout=self.timeout,
             )
         except Exception as e:
@@ -231,6 +250,18 @@ class Proxmox(Machinery):
             raise errors.MachineNotFoundError(f"Cloudn't find a vm with {name} as name")
         else:
             return vm_id, vm_node
+
+    def _wait_for_task(self, prox, node_name, task_id):
+        log.debug(f"Waiting for task {task_id} to complete...")
+        while True:
+            status = prox.nodes(node_name).tasks(task_id).status.get()
+            if status["status"] == "stopped":
+                if status["exitstatus"] == "OK":
+                    log.debug(f"Task {task_id} completed successfully.")
+                    break
+                else:
+                    raise errors.MachineryActionError(f"Proxmox task {task_id} failed: {status['exitstatus']}")
+            time.sleep(1)
 
     @staticmethod
     def verify_dependencies():

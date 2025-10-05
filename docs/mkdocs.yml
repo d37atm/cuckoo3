@@ -67,6 +67,7 @@ nav:
 - Configuring:
   - System dependencies: configuring/system.md
   - VMCloak: configuring/vmcloak.md
+  - Proxmox: configuring/proxmox.md
   - Cuckoo3: configuring/cuckoo.md
   - Web UI: configuring/web-ui.md
   - Web API: configuring/web-api.md
